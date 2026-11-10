@@ -1,4 +1,4 @@
-import os, re, json, hmac
+import os, re, json, hmac, tempfile
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends
 from fastapi.responses import FileResponse, Response
@@ -48,6 +48,42 @@ async def upload_avatar(file: UploadFile = File(...), _: None = Depends(auth)):
     AVATAR.parent.mkdir(exist_ok=True)
     AVATAR.write_bytes(content)
     return {"ok": True}
+
+
+# Protected PDF upload for private local or temporary Render storage.
+# Render Free disks are ephemeral; files can be lost on redeploy or restart.
+MAX_PDF_BYTES = 12 * 1024 * 1024
+MAX_PDF_PAGES = 80
+
+@app.post("/api/award")
+async def upload_award(file: UploadFile = File(...), _: None = Depends(auth)):
+    if file.content_type not in ("application/pdf", "application/octet-stream"):
+        raise HTTPException(400, "Please select a PDF file")
+    content = await file.read(MAX_PDF_BYTES + 1)
+    if not content.startswith(b"%PDF-") or len(content) > MAX_PDF_BYTES:
+        raise HTTPException(400, "Invalid PDF or file exceeds 12 MB")
+    try:
+        with fitz.open(stream=content, filetype="pdf") as pdf:
+            if pdf.needs_pass or pdf.page_count < 1 or pdf.page_count > MAX_PDF_PAGES:
+                raise HTTPException(400, "Encrypted PDF or unsupported number of pages")
+            texts = [p.get_text("text") for p in pdf]
+            if not any(x.strip() for x in texts):
+                raise HTTPException(400, "No selectable PDF text found. An OCR version is required.")
+            count = pdf.page_count
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(400, "This PDF could not be opened")
+    DOC.parent.mkdir(parents=True, exist_ok=True)
+    fd, tempname = tempfile.mkstemp(prefix="award-", suffix=".pdf", dir=DOC.parent)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(content)
+        os.replace(tempname, DOC)
+    finally:
+        if os.path.exists(tempname):
+            os.unlink(tempname)
+    return {"ok": True, "pages": count, "storage": "temporary"}
 
 @app.post("/api/ask")
 def ask(q: Question, _: None = Depends(auth)):
